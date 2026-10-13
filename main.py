@@ -3,7 +3,7 @@
 """
 Портативный калькулятор потерь напряжения и токов однофазного КЗ.
 Иерархия: ВРУ → неограниченное число щитов → группы в каждом щите.
-Экспорт таблиц в Excel + однолинейных схем каждого щита в PDF (упрощённо по ГОСТ).
+Экспорт: Excel + PDF + DXF однолинейных схем каждого щита.
 """
 
 import json
@@ -23,11 +23,16 @@ except ImportError:
 try:
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.units import mm
-    from reportlab.pdfgen import canvas
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.pdfgen import canvas as pdf_canvas
 except ImportError:
-    canvas = None
+    pdf_canvas = None
+
+try:
+    import ezdxf
+    from ezdxf import units
+    from ezdxf.enums import TextEntityAlignment
+except ImportError:
+    ezdxf = None
 
 # ====================== Константы и формулы ======================
 
@@ -113,11 +118,10 @@ class CableRow:
         return r
 
 class Board:
-    """Щит (ВРУ или распределительный щит)"""
     def __init__(self, title="Щит", is_vru=False):
         self.title = title
         self.is_vru = is_vru
-        self.rows = []  # отходящие группы / фидеры
+        self.rows = []
 
     def to_dict(self):
         return {"title": self.title, "is_vru": self.is_vru, "rows": [r.to_dict() for r in self.rows]}
@@ -139,7 +143,7 @@ class Project:
             "U_lv": 0.4,
         }
         self.vru = Board("ВРУ", is_vru=True)
-        self.boards = []  # дополнительные щиты (неограниченно)
+        self.boards = []
 
     def all_boards(self):
         return [self.vru] + self.boards
@@ -161,8 +165,7 @@ class Project:
             p.vru = Board.from_dict(d["vru"])
         if "boards" in d:
             p.boards = [Board.from_dict(b) for b in d["boards"]]
-        # совместимость со старым форматом
-        if "sheets" in d:
+        if "sheets" in d:  # совместимость
             sheets = d["sheets"]
             if sheets:
                 p.vru = Board.from_dict(sheets[0])
@@ -171,35 +174,29 @@ class Project:
                 p.boards = [Board.from_dict(s) for s in sheets[1:]]
         return p
 
-# ====================== PDF-схемы (упрощённо по ГОСТ) ======================
+# ====================== PDF-схемы ======================
 
-def draw_single_line_scheme(board, project, path):
-    """Упрощённая однолинейная схема щита в PDF (формат А4 альбом)"""
-    if canvas is None:
+def draw_single_line_scheme_pdf(board, project, path):
+    if pdf_canvas is None:
         raise RuntimeError("reportlab не установлен")
 
-    c = canvas.Canvas(path, pagesize=landscape(A4))
+    c = pdf_canvas.Canvas(path, pagesize=landscape(A4))
     W, H = landscape(A4)
-
-    # Рамка и основная надпись (упрощённо ГОСТ)
     margin = 10 * mm
     c.setStrokeColorRGB(0, 0, 0)
     c.setLineWidth(1.5)
     c.rect(margin, margin, W - 2 * margin, H - 2 * margin)
 
-    # Заголовок
     c.setFont("Helvetica-Bold", 14)
     c.drawCentredString(W / 2, H - 18 * mm, f"Однолинейная схема. {board.title}")
     c.setFont("Helvetica", 9)
     c.drawCentredString(W / 2, H - 24 * mm, f"Проект: {project.name}  |  {datetime.now().strftime('%d.%m.%Y')}")
 
-    # Параметры трансформатора
     tr = project.transformer
     c.setFont("Helvetica", 8)
     c.drawString(margin + 5 * mm, H - 32 * mm,
                  f"Трансформатор: {tr['S_kVA']} кВА, uk={tr['uk_pct']}%, схема {tr['scheme']}")
 
-    # Шина
     bus_y = H - 50 * mm
     bus_x0 = 40 * mm
     bus_x1 = W - 40 * mm
@@ -208,23 +205,18 @@ def draw_single_line_scheme(board, project, path):
     c.setFont("Helvetica-Bold", 9)
     c.drawString(bus_x0, bus_y + 3 * mm, f"Шина {board.title}  0,4 кВ")
 
-    # Отходящие линии
     n = max(len(board.rows), 1)
     step = (bus_x1 - bus_x0) / (n + 1)
     c.setLineWidth(1.0)
 
     for i, r in enumerate(board.rows):
         x = bus_x0 + step * (i + 1)
-        # Вертикаль от шины
         c.line(x, bus_y, x, bus_y - 15 * mm)
-        # Условный автомат (прямоугольник)
         c.rect(x - 4 * mm, bus_y - 22 * mm, 8 * mm, 7 * mm)
         c.setFont("Helvetica", 6)
         c.drawCentredString(x, bus_y - 19 * mm, "QF")
-        # Дальше линия
         c.line(x, bus_y - 22 * mm, x, bus_y - 45 * mm)
 
-        # Подписи (боковик-подобно)
         y_txt = bus_y - 50 * mm
         c.setFont("Helvetica", 6)
         lines = [
@@ -238,11 +230,10 @@ def draw_single_line_scheme(board, project, path):
         for j, t in enumerate(lines):
             c.drawCentredString(x, y_txt - j * 3.5 * mm, t)
 
-    # Основная надпись внизу справа (упрощённо)
-    c.setLineWidth(0.7)
     stamp_w, stamp_h = 110 * mm, 30 * mm
     sx = W - margin - stamp_w
     sy = margin + 2 * mm
+    c.setLineWidth(0.7)
     c.rect(sx, sy, stamp_w, stamp_h)
     c.line(sx, sy + 10 * mm, sx + stamp_w, sy + 10 * mm)
     c.setFont("Helvetica", 7)
@@ -253,8 +244,126 @@ def draw_single_line_scheme(board, project, path):
     c.setFont("Helvetica", 7)
     c.drawString(margin + 3 * mm, margin + 3 * mm,
                  "Упрощённая однолинейная схема (ориентир ГОСТ 2.702 / 21.608). Для проектной документации доработать в CAD.")
-
     c.save()
+
+# ====================== DXF-схемы ======================
+
+def draw_single_line_scheme_dxf(board, project, path):
+    """Однолинейная схема щита в DXF (открывается в AutoCAD → Save as DWG)"""
+    if ezdxf is None:
+        raise RuntimeError("ezdxf не установлен")
+
+    doc = ezdxf.new("R2010")  # совместимый формат
+    doc.units = units.MM
+    msp = doc.modelspace()
+
+    # Слои
+    doc.layers.add("РАМКА", color=7)
+    doc.layers.add("ШИНА", color=1)       # красный
+    doc.layers.add("АППАРАТЫ", color=5)   # синий
+    doc.layers.add("ЛИНИИ", color=3)      # зелёный
+    doc.layers.add("ТЕКСТ", color=7)
+    doc.layers.add("ОСНОВНАЯ_НАДПИСЬ", color=7)
+
+    # Размеры листа (А3 альбом в мм)
+    W, H = 420.0, 297.0
+    margin = 10.0
+
+    # Рамка
+    msp.add_lwpolyline(
+        [(margin, margin), (W - margin, margin), (W - margin, H - margin), (margin, H - margin), (margin, margin)],
+        dxfattribs={"layer": "РАМКА", "lineweight": 50}
+    )
+
+    # Заголовок
+    msp.add_text(
+        f"Однолинейная схема. {board.title}",
+        height=5.0,
+        dxfattribs={"layer": "ТЕКСТ", "style": "Standard"}
+    ).set_placement((W / 2, H - 18), align=TextEntityAlignment.MIDDLE_CENTER)
+
+    msp.add_text(
+        f"Проект: {project.name}  |  {datetime.now().strftime('%d.%m.%Y')}",
+        height=3.0,
+        dxfattribs={"layer": "ТЕКСТ"}
+    ).set_placement((W / 2, H - 25), align=TextEntityAlignment.MIDDLE_CENTER)
+
+    tr = project.transformer
+    msp.add_text(
+        f"Трансформатор: {tr['S_kVA']} кВА, uk={tr['uk_pct']}%, схема {tr['scheme']}",
+        height=2.5,
+        dxfattribs={"layer": "ТЕКСТ"}
+    ).set_placement((margin + 5, H - 32))
+
+    # Шина
+    bus_y = H - 55
+    bus_x0 = 50
+    bus_x1 = W - 50
+    msp.add_line((bus_x0, bus_y), (bus_x1, bus_y), dxfattribs={"layer": "ШИНА", "lineweight": 70})
+    msp.add_text(
+        f"Шина {board.title}  0,4 кВ",
+        height=3.0,
+        dxfattribs={"layer": "ТЕКСТ"}
+    ).set_placement((bus_x0, bus_y + 4))
+
+    n = max(len(board.rows), 1)
+    step = (bus_x1 - bus_x0) / (n + 1)
+
+    for i, r in enumerate(board.rows):
+        x = bus_x0 + step * (i + 1)
+
+        # Вертикаль от шины до автомата
+        msp.add_line((x, bus_y), (x, bus_y - 18), dxfattribs={"layer": "ЛИНИИ"})
+
+        # Условный автомат (прямоугольник)
+        qf_h, qf_w = 10, 8
+        msp.add_lwpolyline(
+            [(x - qf_w/2, bus_y - 18 - qf_h), (x + qf_w/2, bus_y - 18 - qf_h),
+             (x + qf_w/2, bus_y - 18), (x - qf_w/2, bus_y - 18), (x - qf_w/2, bus_y - 18 - qf_h)],
+            dxfattribs={"layer": "АППАРАТЫ", "lineweight": 35}
+        )
+        msp.add_text("QF", height=2.2, dxfattribs={"layer": "ТЕКСТ"}).set_placement(
+            (x, bus_y - 18 - qf_h/2), align=TextEntityAlignment.MIDDLE_CENTER
+        )
+
+        # Линия ниже автомата
+        msp.add_line((x, bus_y - 18 - qf_h), (x, bus_y - 50), dxfattribs={"layer": "ЛИНИИ"})
+
+        # Подписи
+        y_txt = bus_y - 55
+        lines = [
+            f"{r.num or i+1}. {r.name or 'Группа'}",
+            f"{r.brand} {r.cores}x{r.section}",
+            f"L={r.len_sum or r.len_line:.0f} м",
+            f"I={r.current:.1f} А",
+            f"ΔU={r.dU_pct:.2f}%",
+            f"Iкз={r.Isc:.0f} А",
+        ]
+        for j, t in enumerate(lines):
+            msp.add_text(t, height=2.0, dxfattribs={"layer": "ТЕКСТ"}).set_placement(
+                (x, y_txt - j * 4.0), align=TextEntityAlignment.MIDDLE_CENTER
+            )
+
+    # Основная надпись (упрощённо)
+    stamp_w, stamp_h = 120, 35
+    sx = W - margin - stamp_w
+    sy = margin + 3
+    msp.add_lwpolyline(
+        [(sx, sy), (sx + stamp_w, sy), (sx + stamp_w, sy + stamp_h), (sx, sy + stamp_h), (sx, sy)],
+        dxfattribs={"layer": "ОСНОВНАЯ_НАДПИСЬ"}
+    )
+    msp.add_line((sx, sy + 12), (sx + stamp_w, sy + 12), dxfattribs={"layer": "ОСНОВНАЯ_НАДПИСЬ"})
+    msp.add_text(f"Лист: схема {board.title}", height=2.5, dxfattribs={"layer": "ТЕКСТ"}).set_placement((sx + 3, sy + 25))
+    msp.add_text(f"Проект: {project.name}", height=2.5, dxfattribs={"layer": "ТЕКСТ"}).set_placement((sx + 3, sy + 16))
+    msp.add_text(f"Дата: {datetime.now().strftime('%d.%m.%Y')}", height=2.5, dxfattribs={"layer": "ТЕКСТ"}).set_placement((sx + 3, sy + 5))
+
+    msp.add_text(
+        "Упрощённая однолинейная схема (ориентир ГОСТ 2.702 / 21.608). Откройте в AutoCAD → Сохранить как DWG.",
+        height=2.0,
+        dxfattribs={"layer": "ТЕКСТ"}
+    ).set_placement((margin + 3, margin + 3))
+
+    doc.saveas(path)
 
 # ====================== GUI ======================
 
@@ -264,14 +373,13 @@ class App(tk.Tk):
         self.title("Калькулятор потерь напряжения и токов КЗ (портативный)")
         self.geometry("1450x820")
         self.project = Project()
-        self.current_board_idx = 0  # 0 = ВРУ, 1+ = boards
+        self.current_board_idx = 0
 
         self._build_menu()
         self._build_transformer_frame()
         self._build_board_selector()
         self._build_table_area()
         self._build_buttons()
-
         self.refresh_table()
 
     def _build_menu(self):
@@ -282,7 +390,8 @@ class App(tk.Tk):
         filemenu.add_command(label="Сохранить...", command=self.save_project)
         filemenu.add_separator()
         filemenu.add_command(label="Экспорт в Excel...", command=self.export_excel)
-        filemenu.add_command(label="Экспорт схем щитов (PDF)...", command=self.export_schemes)
+        filemenu.add_command(label="Экспорт схем (PDF)...", command=self.export_schemes_pdf)
+        filemenu.add_command(label="Экспорт схем (DXF → DWG)...", command=self.export_schemes_dxf)
         filemenu.add_separator()
         filemenu.add_command(label="Выход", command=self.quit)
         menubar.add_cascade(label="Файл", menu=filemenu)
@@ -339,8 +448,6 @@ class App(tk.Tk):
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
-
-        # Двойной клик — редактирование
         self.tree.bind("<Double-1>", self.edit_row)
 
         btn_fr = ttk.Frame(self)
@@ -355,7 +462,8 @@ class App(tk.Tk):
         ttk.Button(fr, text="Рассчитать всё", command=self.recalc_all).pack(side="left", padx=4)
         ttk.Button(fr, text="Ведомость кабелей", command=self.show_cable_summary).pack(side="left", padx=4)
         ttk.Button(fr, text="Экспорт Excel", command=self.export_excel).pack(side="left", padx=4)
-        ttk.Button(fr, text="Экспорт схем (PDF)", command=self.export_schemes).pack(side="left", padx=4)
+        ttk.Button(fr, text="Экспорт PDF", command=self.export_schemes_pdf).pack(side="left", padx=4)
+        ttk.Button(fr, text="Экспорт DXF (→DWG)", command=self.export_schemes_dxf).pack(side="left", padx=4)
 
     def _current_board(self):
         if self.current_board_idx == 0:
@@ -427,7 +535,6 @@ class App(tk.Tk):
         self.refresh_table()
 
     def edit_row(self, event):
-        """Простой диалог редактирования выбранной строки"""
         sel = self.tree.selection()
         if not sel:
             return
@@ -611,7 +718,6 @@ class App(tk.Tk):
             for col in range(1, len(headers) + 1):
                 ws.column_dimensions[get_column_letter(col)].width = 11
 
-        # Ведомость
         ws = wb.create_sheet("Ведомость кабелей")
         h2 = ["Марка кабеля", "жил×сечение", "в лотке", "в гофре", "в канале", "в ПВХ-трубе", "в стальной трубе", "Итого длина"]
         for col, h in enumerate(h2, 1):
@@ -637,7 +743,6 @@ class App(tk.Tk):
             for col, v in enumerate(lens, 3):
                 ws.cell(row_idx, col, round(v, 1)).border = thin
 
-        # Трансформатор
         ws = wb.create_sheet("Трансформатор")
         ws["A1"] = "Параметр"
         ws["B1"] = "Значение"
@@ -651,24 +756,48 @@ class App(tk.Tk):
         wb.save(path)
         messagebox.showinfo("Экспорт", f"Excel сохранён:\n{path}")
 
-    def export_schemes(self):
-        if canvas is None:
+    def export_schemes_pdf(self):
+        if pdf_canvas is None:
             messagebox.showerror("Ошибка", "Установите reportlab: pip install reportlab")
             return
         self.recalc_all()
-        folder = filedialog.askdirectory(title="Папка для сохранения схем PDF")
+        folder = filedialog.askdirectory(title="Папка для PDF-схем")
         if not folder:
             return
         count = 0
         for board in self.project.all_boards():
-            safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in board.title)
-            path = os.path.join(folder, f"Схема_{safe_name}.pdf")
+            safe = "".join(c if c.isalnum() or c in " -_" else "_" for c in board.title)
+            path = os.path.join(folder, f"Схема_{safe}.pdf")
             try:
-                draw_single_line_scheme(board, self.project, path)
+                draw_single_line_scheme_pdf(board, self.project, path)
                 count += 1
             except Exception as e:
-                messagebox.showerror("Ошибка", f"Не удалось создать схему {board.title}:\n{e}")
-        messagebox.showinfo("Готово", f"Создано схем: {count}\nПапка: {folder}")
+                messagebox.showerror("Ошибка", f"{board.title}: {e}")
+        messagebox.showinfo("Готово", f"Создано PDF-схем: {count}\n{folder}")
+
+    def export_schemes_dxf(self):
+        if ezdxf is None:
+            messagebox.showerror("Ошибка", "Установите ezdxf: pip install ezdxf")
+            return
+        self.recalc_all()
+        folder = filedialog.askdirectory(title="Папка для DXF-схем (откройте в AutoCAD → Save as DWG)")
+        if not folder:
+            return
+        count = 0
+        for board in self.project.all_boards():
+            safe = "".join(c if c.isalnum() or c in " -_" else "_" for c in board.title)
+            path = os.path.join(folder, f"Схема_{safe}.dxf")
+            try:
+                draw_single_line_scheme_dxf(board, self.project, path)
+                count += 1
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"{board.title}: {e}")
+        messagebox.showinfo(
+            "Готово",
+            f"Создано DXF-схем: {count}\n{folder}\n\n"
+            "Откройте файл в AutoCAD / nanoCAD / BricsCAD\n"
+            "и сохраните как .DWG (Файл → Сохранить как → DWG)."
+        )
 
 if __name__ == "__main__":
     app = App()
