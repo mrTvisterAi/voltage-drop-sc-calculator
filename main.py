@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Калькулятор потерь напряжения и токов однофазного КЗ
-с учетом трансформатора. Экспорт в Excel, сохранение/загрузка проектов.
+Портативный калькулятор потерь напряжения и токов однофазного КЗ.
+Иерархия: ВРУ → неограниченное число щитов → группы в каждом щите.
+Экспорт таблиц в Excel + однолинейных схем каждого щита в PDF (упрощённо по ГОСТ).
 """
 
 import json
 import math
+import os
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from copy import deepcopy
+from tkinter import ttk, filedialog, messagebox, simpledialog
 from datetime import datetime
 
 try:
@@ -19,56 +20,56 @@ try:
 except ImportError:
     openpyxl = None
 
+try:
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+except ImportError:
+    canvas = None
+
 # ====================== Константы и формулы ======================
 
-RHO_CU = 0.0175   # Ом·мм²/м медь (20°C)
-RHO_AL = 0.0280   # Ом·мм²/м алюминий
-X0_CABLE = 0.08   # Ом/км типичное реактивное сопротивление кабеля
+RHO_CU = 0.0175
+RHO_AL = 0.0280
+X0_CABLE = 0.08  # Ом/км
 
 def calc_current(power_kw, voltage, cos_phi, phases=1):
-    """Ток нагрузки, А"""
     if cos_phi <= 0 or voltage <= 0:
         return 0.0
     if phases == 3:
         return (power_kw * 1000) / (math.sqrt(3) * voltage * cos_phi)
-    else:
-        return (power_kw * 1000) / (voltage * cos_phi)
+    return (power_kw * 1000) / (voltage * cos_phi)
 
 def calc_voltage_drop(I, L_m, S_mm2, cos_phi, material="медь", phases=1):
-    """Потеря напряжения ΔU в В и %"""
     if S_mm2 <= 0 or L_m <= 0 or I <= 0:
         return 0.0, 0.0
-    rho = RHO_CU if material.lower().startswith("м") else RHO_AL
-    R = rho * L_m / S_mm2          # Ом (один проводник)
-    X = X0_CABLE * L_m / 1000      # Ом
-    sin_phi = math.sqrt(max(0.0, 1 - cos_phi**2))
+    rho = RHO_CU if str(material).lower().startswith("м") else RHO_AL
+    R = rho * L_m / S_mm2
+    X = X0_CABLE * L_m / 1000
+    sin_phi = math.sqrt(max(0.0, 1 - cos_phi ** 2))
     if phases == 3:
         dU = math.sqrt(3) * I * (R * cos_phi + X * sin_phi)
         U_nom = 400.0
     else:
         dU = 2 * I * (R * cos_phi + X * sin_phi)
         U_nom = 230.0
-    dU_pct = 100.0 * dU / U_nom
-    return dU, dU_pct
+    return dU, 100.0 * dU / U_nom
 
 def calc_transformer_Z(S_kVA, uk_pct, Pk_W, U_lv=0.4):
-    """Сопротивление трансформатора, приведённое к НН (Ом)"""
     if S_kVA <= 0:
         return 0.0, 0.0
-    # uk% = 100 * Z * S / U²
     Z = (uk_pct / 100.0) * (U_lv ** 2) / S_kVA
-    # R ≈ Pk / (3 * Iном²) но упрощённо
     Inom = S_kVA / (math.sqrt(3) * U_lv)
     R = Pk_W / (3 * Inom ** 2) if Inom > 0 else 0.0
-    X = math.sqrt(max(0.0, Z**2 - R**2))
+    X = math.sqrt(max(0.0, Z ** 2 - R ** 2))
     return R, X
 
-def calc_sc_current_1ph(U_ph, R_tr, X_tr, R_cab, X_cab, L_m, contacts_mohm=15.0):
-    """Ток однофазного КЗ (петля фаза-ноль), А"""
-    # 2 * кабель (фаза + ноль)
+def calc_sc_current_1ph(U_ph, R_tr, X_tr, R_cab, X_cab, contacts_mohm=15.0):
     R_loop = R_tr + 2 * R_cab + contacts_mohm / 1000.0
     X_loop = X_tr + 2 * X_cab
-    Z_loop = math.sqrt(R_loop**2 + X_loop**2)
+    Z_loop = math.sqrt(R_loop ** 2 + X_loop ** 2)
     if Z_loop < 1e-9:
         return 0.0
     return U_ph / Z_loop
@@ -81,8 +82,8 @@ class CableRow:
         self.name = ""
         self.group_num = ""
         self.floor = ""
-        self.power = 0.0          # кВт
-        self.voltage = 230        # 230 или 400
+        self.power = 0.0
+        self.voltage = 230
         self.cos_phi = 0.9
         self.current = 0.0
         self.n_cables = 1
@@ -108,22 +109,24 @@ class CableRow:
     @classmethod
     def from_dict(cls, d):
         r = cls()
-        r.__dict__.update(d)
+        r.__dict__.update({k: v for k, v in d.items() if k in r.__dict__})
         return r
 
-class GroupSheet:
-    def __init__(self, title="Группа"):
+class Board:
+    """Щит (ВРУ или распределительный щит)"""
+    def __init__(self, title="Щит", is_vru=False):
         self.title = title
-        self.rows = []
+        self.is_vru = is_vru
+        self.rows = []  # отходящие группы / фидеры
 
     def to_dict(self):
-        return {"title": self.title, "rows": [r.to_dict() for r in self.rows]}
+        return {"title": self.title, "is_vru": self.is_vru, "rows": [r.to_dict() for r in self.rows]}
 
     @classmethod
     def from_dict(cls, d):
-        g = cls(d.get("title", "Группа"))
-        g.rows = [CableRow.from_dict(r) for r in d.get("rows", [])]
-        return g
+        b = cls(d.get("title", "Щит"), d.get("is_vru", False))
+        b.rows = [CableRow.from_dict(r) for r in d.get("rows", [])]
+        return b
 
 class Project:
     def __init__(self):
@@ -135,15 +138,18 @@ class Project:
             "scheme": "D/Yn",
             "U_lv": 0.4,
         }
-        self.sheets = [GroupSheet("ВРУ")]
-        for i in range(1, 10):
-            self.sheets.append(GroupSheet(f"Группа {i}"))
+        self.vru = Board("ВРУ", is_vru=True)
+        self.boards = []  # дополнительные щиты (неограниченно)
+
+    def all_boards(self):
+        return [self.vru] + self.boards
 
     def to_dict(self):
         return {
             "name": self.name,
             "transformer": self.transformer,
-            "sheets": [s.to_dict() for s in self.sheets],
+            "vru": self.vru.to_dict(),
+            "boards": [b.to_dict() for b in self.boards],
         }
 
     @classmethod
@@ -151,25 +157,122 @@ class Project:
         p = cls()
         p.name = d.get("name", "Проект")
         p.transformer = d.get("transformer", p.transformer)
-        p.sheets = [GroupSheet.from_dict(s) for s in d.get("sheets", [])]
+        if "vru" in d:
+            p.vru = Board.from_dict(d["vru"])
+        if "boards" in d:
+            p.boards = [Board.from_dict(b) for b in d["boards"]]
+        # совместимость со старым форматом
+        if "sheets" in d:
+            sheets = d["sheets"]
+            if sheets:
+                p.vru = Board.from_dict(sheets[0])
+                p.vru.is_vru = True
+                p.vru.title = "ВРУ"
+                p.boards = [Board.from_dict(s) for s in sheets[1:]]
         return p
+
+# ====================== PDF-схемы (упрощённо по ГОСТ) ======================
+
+def draw_single_line_scheme(board, project, path):
+    """Упрощённая однолинейная схема щита в PDF (формат А4 альбом)"""
+    if canvas is None:
+        raise RuntimeError("reportlab не установлен")
+
+    c = canvas.Canvas(path, pagesize=landscape(A4))
+    W, H = landscape(A4)
+
+    # Рамка и основная надпись (упрощённо ГОСТ)
+    margin = 10 * mm
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setLineWidth(1.5)
+    c.rect(margin, margin, W - 2 * margin, H - 2 * margin)
+
+    # Заголовок
+    c.setFont("Helvetica-Bold", 14)
+    c.drawCentredString(W / 2, H - 18 * mm, f"Однолинейная схема. {board.title}")
+    c.setFont("Helvetica", 9)
+    c.drawCentredString(W / 2, H - 24 * mm, f"Проект: {project.name}  |  {datetime.now().strftime('%d.%m.%Y')}")
+
+    # Параметры трансформатора
+    tr = project.transformer
+    c.setFont("Helvetica", 8)
+    c.drawString(margin + 5 * mm, H - 32 * mm,
+                 f"Трансформатор: {tr['S_kVA']} кВА, uk={tr['uk_pct']}%, схема {tr['scheme']}")
+
+    # Шина
+    bus_y = H - 50 * mm
+    bus_x0 = 40 * mm
+    bus_x1 = W - 40 * mm
+    c.setLineWidth(2.5)
+    c.line(bus_x0, bus_y, bus_x1, bus_y)
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(bus_x0, bus_y + 3 * mm, f"Шина {board.title}  0,4 кВ")
+
+    # Отходящие линии
+    n = max(len(board.rows), 1)
+    step = (bus_x1 - bus_x0) / (n + 1)
+    c.setLineWidth(1.0)
+
+    for i, r in enumerate(board.rows):
+        x = bus_x0 + step * (i + 1)
+        # Вертикаль от шины
+        c.line(x, bus_y, x, bus_y - 15 * mm)
+        # Условный автомат (прямоугольник)
+        c.rect(x - 4 * mm, bus_y - 22 * mm, 8 * mm, 7 * mm)
+        c.setFont("Helvetica", 6)
+        c.drawCentredString(x, bus_y - 19 * mm, "QF")
+        # Дальше линия
+        c.line(x, bus_y - 22 * mm, x, bus_y - 45 * mm)
+
+        # Подписи (боковик-подобно)
+        y_txt = bus_y - 50 * mm
+        c.setFont("Helvetica", 6)
+        lines = [
+            f"{r.num or i+1}. {r.name or 'Группа'}",
+            f"{r.brand} {r.cores}x{r.section}",
+            f"L={r.len_sum or r.len_line:.0f} м",
+            f"I={r.current:.1f} А",
+            f"ΔU={r.dU_pct:.2f}%",
+            f"Iкз={r.Isc:.0f} А",
+        ]
+        for j, t in enumerate(lines):
+            c.drawCentredString(x, y_txt - j * 3.5 * mm, t)
+
+    # Основная надпись внизу справа (упрощённо)
+    c.setLineWidth(0.7)
+    stamp_w, stamp_h = 110 * mm, 30 * mm
+    sx = W - margin - stamp_w
+    sy = margin + 2 * mm
+    c.rect(sx, sy, stamp_w, stamp_h)
+    c.line(sx, sy + 10 * mm, sx + stamp_w, sy + 10 * mm)
+    c.setFont("Helvetica", 7)
+    c.drawString(sx + 2 * mm, sy + 22 * mm, f"Лист: схема {board.title}")
+    c.drawString(sx + 2 * mm, sy + 14 * mm, f"Проект: {project.name}")
+    c.drawString(sx + 2 * mm, sy + 4 * mm, f"Дата: {datetime.now().strftime('%d.%m.%Y')}")
+
+    c.setFont("Helvetica", 7)
+    c.drawString(margin + 3 * mm, margin + 3 * mm,
+                 "Упрощённая однолинейная схема (ориентир ГОСТ 2.702 / 21.608). Для проектной документации доработать в CAD.")
+
+    c.save()
 
 # ====================== GUI ======================
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Калькулятор потерь напряжения и токов КЗ")
-        self.geometry("1400x800")
+        self.title("Калькулятор потерь напряжения и токов КЗ (портативный)")
+        self.geometry("1450x820")
         self.project = Project()
-        self.current_sheet_idx = 0
+        self.current_board_idx = 0  # 0 = ВРУ, 1+ = boards
 
         self._build_menu()
         self._build_transformer_frame()
-        self._build_notebook()
+        self._build_board_selector()
+        self._build_table_area()
         self._build_buttons()
 
-        self.refresh_sheet()
+        self.refresh_table()
 
     def _build_menu(self):
         menubar = tk.Menu(self)
@@ -179,6 +282,7 @@ class App(tk.Tk):
         filemenu.add_command(label="Сохранить...", command=self.save_project)
         filemenu.add_separator()
         filemenu.add_command(label="Экспорт в Excel...", command=self.export_excel)
+        filemenu.add_command(label="Экспорт схем щитов (PDF)...", command=self.export_schemes)
         filemenu.add_separator()
         filemenu.add_command(label="Выход", command=self.quit)
         menubar.add_cascade(label="Файл", menu=filemenu)
@@ -186,8 +290,7 @@ class App(tk.Tk):
 
     def _build_transformer_frame(self):
         fr = ttk.LabelFrame(self, text="Трансформатор")
-        fr.pack(fill="x", padx=5, pady=5)
-
+        fr.pack(fill="x", padx=5, pady=3)
         self.tr_vars = {}
         fields = [
             ("S_kVA", "Мощность, кВА", 250),
@@ -196,75 +299,108 @@ class App(tk.Tk):
             ("U_lv", "Uнн, кВ", 0.4),
         ]
         for i, (key, label, default) in enumerate(fields):
-            ttk.Label(fr, text=label).grid(row=0, column=i*2, padx=3, pady=2)
+            ttk.Label(fr, text=label).grid(row=0, column=i * 2, padx=3, pady=2)
             var = tk.DoubleVar(value=self.project.transformer.get(key, default))
             self.tr_vars[key] = var
-            ttk.Entry(fr, textvariable=var, width=10).grid(row=0, column=i*2+1, padx=3)
-
+            ttk.Entry(fr, textvariable=var, width=9).grid(row=0, column=i * 2 + 1, padx=3)
         ttk.Label(fr, text="Схема:").grid(row=0, column=8)
         self.scheme_var = tk.StringVar(value=self.project.transformer.get("scheme", "D/Yn"))
-        ttk.Combobox(fr, textvariable=self.scheme_var, values=["D/Yn", "Y/Yn", "Y/Zn"], width=8).grid(row=0, column=9)
+        ttk.Combobox(fr, textvariable=self.scheme_var, values=["D/Yn", "Y/Yn", "Y/Zn"], width=7).grid(row=0, column=9)
 
-    def _build_notebook(self):
-        self.nb = ttk.Notebook(self)
-        self.nb.pack(fill="both", expand=True, padx=5, pady=5)
-        self.frames = []
-        for i, sheet in enumerate(self.project.sheets):
-            fr = ttk.Frame(self.nb)
-            self.nb.add(fr, text=sheet.title)
-            self.frames.append(fr)
-            self._build_sheet_ui(fr, i)
-        self.nb.bind("<<NotebookTabChanged>>", self.on_tab_changed)
+    def _build_board_selector(self):
+        fr = ttk.Frame(self)
+        fr.pack(fill="x", padx=5, pady=3)
+        ttk.Label(fr, text="Щит:").pack(side="left")
+        self.board_var = tk.StringVar()
+        self.board_combo = ttk.Combobox(fr, textvariable=self.board_var, width=40, state="readonly")
+        self.board_combo.pack(side="left", padx=5)
+        self.board_combo.bind("<<ComboboxSelected>>", self.on_board_changed)
+        ttk.Button(fr, text="+ Щит", command=self.add_board).pack(side="left", padx=2)
+        ttk.Button(fr, text="Переименовать", command=self.rename_board).pack(side="left", padx=2)
+        ttk.Button(fr, text="Удалить щит", command=self.del_board).pack(side="left", padx=2)
+        self._update_board_list()
 
-    def _build_sheet_ui(self, parent, idx):
-        # Таблица
+    def _build_table_area(self):
+        fr = ttk.Frame(self)
+        fr.pack(fill="both", expand=True, padx=5, pady=3)
         cols = [
             "№", "Наименование", "№ гр.", "Этаж", "P, кВт", "U, В", "cosφ",
             "I, А", "N каб.", "Марка", "Жил", "S, мм²",
             "Лоток", "Гофра", "Канал", "ПВХ", "Сталь",
             "Σ L", "Матер.", "L лин.", "L прив.", "ΔU, В", "ΔU, %", "Iкз1, А"
         ]
-        tree = ttk.Treeview(parent, columns=cols, show="headings", height=18)
+        self.tree = ttk.Treeview(fr, columns=cols, show="headings", height=20)
         for c in cols:
-            tree.heading(c, text=c)
-            tree.column(c, width=55, anchor="center")
-        tree.column("Наименование", width=120)
-        tree.column("Марка", width=80)
-
-        vsb = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=vsb.set)
-        tree.pack(side="left", fill="both", expand=True)
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=52, anchor="center")
+        self.tree.column("Наименование", width=110)
+        self.tree.column("Марка", width=75)
+        vsb = ttk.Scrollbar(fr, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
 
-        # Сохраняем ссылку
-        if not hasattr(self, "trees"):
-            self.trees = []
-        self.trees.append(tree)
+        # Двойной клик — редактирование
+        self.tree.bind("<Double-1>", self.edit_row)
 
-        # Кнопки управления строками
-        btn_fr = ttk.Frame(parent)
-        btn_fr.pack(fill="x")
-        ttk.Button(btn_fr, text="+ строка", command=lambda: self.add_row(idx)).pack(side="left", padx=2)
-        ttk.Button(btn_fr, text="Удалить", command=lambda: self.del_row(idx)).pack(side="left", padx=2)
-        ttk.Button(btn_fr, text="Рассчитать", command=lambda: self.recalc_sheet(idx)).pack(side="left", padx=2)
+        btn_fr = ttk.Frame(self)
+        btn_fr.pack(fill="x", padx=5)
+        ttk.Button(btn_fr, text="+ строка", command=self.add_row).pack(side="left", padx=2)
+        ttk.Button(btn_fr, text="Удалить строку", command=self.del_row).pack(side="left", padx=2)
+        ttk.Button(btn_fr, text="Рассчитать текущий щит", command=self.recalc_current).pack(side="left", padx=2)
 
     def _build_buttons(self):
         fr = ttk.Frame(self)
         fr.pack(fill="x", padx=5, pady=5)
-        ttk.Button(fr, text="Рассчитать всё", command=self.recalc_all).pack(side="left", padx=5)
-        ttk.Button(fr, text="Сводная ведомость кабелей", command=self.show_cable_summary).pack(side="left", padx=5)
-        ttk.Button(fr, text="Экспорт Excel", command=self.export_excel).pack(side="left", padx=5)
+        ttk.Button(fr, text="Рассчитать всё", command=self.recalc_all).pack(side="left", padx=4)
+        ttk.Button(fr, text="Ведомость кабелей", command=self.show_cable_summary).pack(side="left", padx=4)
+        ttk.Button(fr, text="Экспорт Excel", command=self.export_excel).pack(side="left", padx=4)
+        ttk.Button(fr, text="Экспорт схем (PDF)", command=self.export_schemes).pack(side="left", padx=4)
 
-    def on_tab_changed(self, event):
-        self.current_sheet_idx = self.nb.index(self.nb.select())
+    def _current_board(self):
+        if self.current_board_idx == 0:
+            return self.project.vru
+        return self.project.boards[self.current_board_idx - 1]
 
-    def refresh_sheet(self, idx=None):
-        if idx is None:
-            idx = self.current_sheet_idx
-        tree = self.trees[idx]
-        tree.delete(*tree.get_children())
-        sheet = self.project.sheets[idx]
-        for r in sheet.rows:
+    def _update_board_list(self):
+        names = [self.project.vru.title] + [b.title for b in self.project.boards]
+        self.board_combo["values"] = names
+        if names:
+            self.board_combo.current(min(self.current_board_idx, len(names) - 1))
+
+    def on_board_changed(self, event=None):
+        self.current_board_idx = self.board_combo.current()
+        self.refresh_table()
+
+    def add_board(self):
+        name = simpledialog.askstring("Новый щит", "Название щита:", initialvalue=f"Щит {len(self.project.boards)+1}")
+        if name:
+            self.project.boards.append(Board(name))
+            self.current_board_idx = len(self.project.boards)
+            self._update_board_list()
+            self.refresh_table()
+
+    def rename_board(self):
+        b = self._current_board()
+        name = simpledialog.askstring("Переименовать", "Новое название:", initialvalue=b.title)
+        if name:
+            b.title = name
+            self._update_board_list()
+
+    def del_board(self):
+        if self.current_board_idx == 0:
+            messagebox.showwarning("", "ВРУ удалить нельзя")
+            return
+        if messagebox.askyesno("Удалить", f"Удалить щит «{self._current_board().title}»?"):
+            del self.project.boards[self.current_board_idx - 1]
+            self.current_board_idx = 0
+            self._update_board_list()
+            self.refresh_table()
+
+    def refresh_table(self):
+        self.tree.delete(*self.tree.get_children())
+        b = self._current_board()
+        for r in b.rows:
             vals = [
                 r.num, r.name, r.group_num, r.floor, f"{r.power:.2f}", r.voltage,
                 f"{r.cos_phi:.2f}", f"{r.current:.1f}", r.n_cables, r.brand,
@@ -274,68 +410,108 @@ class App(tk.Tk):
                 r.material, f"{r.len_line:.1f}", f"{r.len_reduced:.1f}",
                 f"{r.dU:.2f}", f"{r.dU_pct:.2f}", f"{r.Isc:.0f}"
             ]
-            tree.insert("", "end", values=vals)
+            self.tree.insert("", "end", values=vals)
 
-    def add_row(self, idx):
+    def add_row(self):
         r = CableRow()
-        r.num = str(len(self.project.sheets[idx].rows) + 1)
-        self.project.sheets[idx].rows.append(r)
-        self.refresh_sheet(idx)
+        r.num = str(len(self._current_board().rows) + 1)
+        self._current_board().rows.append(r)
+        self.refresh_table()
 
-    def del_row(self, idx):
-        tree = self.trees[idx]
-        sel = tree.selection()
+    def del_row(self):
+        sel = self.tree.selection()
         if not sel:
             return
-        item = sel[0]
-        pos = tree.index(item)
-        del self.project.sheets[idx].rows[pos]
-        self.refresh_sheet(idx)
+        pos = self.tree.index(sel[0])
+        del self._current_board().rows[pos]
+        self.refresh_table()
+
+    def edit_row(self, event):
+        """Простой диалог редактирования выбранной строки"""
+        sel = self.tree.selection()
+        if not sel:
+            return
+        pos = self.tree.index(sel[0])
+        r = self._current_board().rows[pos]
+
+        win = tk.Toplevel(self)
+        win.title(f"Редактирование строки {r.num}")
+        win.geometry("420x520")
+        fields = [
+            ("num", "№"), ("name", "Наименование"), ("group_num", "№ группы"),
+            ("floor", "Этаж"), ("power", "Мощность, кВт"), ("voltage", "Напряжение (230/400)"),
+            ("cos_phi", "cos φ"), ("n_cables", "Кол-во кабелей"), ("brand", "Марка"),
+            ("cores", "Кол-во жил"), ("section", "Сечение, мм²"),
+            ("len_tray", "Длина в лотке"), ("len_corrug", "в гофре"),
+            ("len_channel", "в канале"), ("len_pvc", "в ПВХ"), ("len_steel", "в стали"),
+            ("material", "Материал (медь/алюм)"), ("len_line", "Длина линии"),
+            ("len_reduced", "Приведённая длина"),
+        ]
+        vars_ = {}
+        for i, (attr, label) in enumerate(fields):
+            ttk.Label(win, text=label).grid(row=i, column=0, sticky="e", padx=4, pady=1)
+            v = tk.StringVar(value=str(getattr(r, attr)))
+            vars_[attr] = v
+            ttk.Entry(win, textvariable=v, width=28).grid(row=i, column=1, padx=4, pady=1)
+
+        def save():
+            for attr, v in vars_.items():
+                val = v.get()
+                old = getattr(r, attr)
+                if isinstance(old, float):
+                    try:
+                        setattr(r, attr, float(val.replace(",", ".")))
+                    except ValueError:
+                        pass
+                elif isinstance(old, int):
+                    try:
+                        setattr(r, attr, int(float(val)))
+                    except ValueError:
+                        pass
+                else:
+                    setattr(r, attr, val)
+            self.refresh_table()
+            win.destroy()
+
+        ttk.Button(win, text="Сохранить", command=save).grid(row=len(fields), column=0, columnspan=2, pady=8)
 
     def _sync_transformer(self):
         for k, v in self.tr_vars.items():
             self.project.transformer[k] = v.get()
         self.project.transformer["scheme"] = self.scheme_var.get()
 
-    def recalc_sheet(self, idx):
+    def _recalc_board(self, board):
         self._sync_transformer()
         tr = self.project.transformer
         R_tr, X_tr = calc_transformer_Z(tr["S_kVA"], tr["uk_pct"], tr["Pk_W"], tr["U_lv"])
-
-        sheet = self.project.sheets[idx]
-        for r in sheet.rows:
+        for r in board.rows:
             phases = 3 if r.voltage >= 380 else 1
             r.current = calc_current(r.power, r.voltage, r.cos_phi, phases)
             r.len_sum = r.len_tray + r.len_corrug + r.len_channel + r.len_pvc + r.len_steel
-            L = r.len_reduced if r.len_reduced > 0 else r.len_line
-            if L <= 0:
-                L = r.len_sum
-            r.dU, r.dU_pct = calc_voltage_drop(
-                r.current, L, r.section, r.cos_phi, r.material, phases
-            )
-            # Сопротивление кабеля на длину L
-            rho = RHO_CU if r.material.lower().startswith("м") else RHO_AL
+            L = r.len_reduced if r.len_reduced > 0 else (r.len_line if r.len_line > 0 else r.len_sum)
+            r.dU, r.dU_pct = calc_voltage_drop(r.current, L, r.section, r.cos_phi, r.material, phases)
+            rho = RHO_CU if str(r.material).lower().startswith("м") else RHO_AL
             R_cab = rho * L / r.section if r.section > 0 else 0
             X_cab = X0_CABLE * L / 1000
-            U_ph = 230.0
-            r.Isc = calc_sc_current_1ph(U_ph, R_tr, X_tr, R_cab, X_cab, L)
-        self.refresh_sheet(idx)
+            r.Isc = calc_sc_current_1ph(230.0, R_tr, X_tr, R_cab, X_cab)
+
+    def recalc_current(self):
+        self._recalc_board(self._current_board())
+        self.refresh_table()
 
     def recalc_all(self):
-        for i in range(len(self.project.sheets)):
-            self.recalc_sheet(i)
-        messagebox.showinfo("Готово", "Все листы пересчитаны")
+        for b in self.project.all_boards():
+            self._recalc_board(b)
+        self.refresh_table()
+        messagebox.showinfo("Готово", "Все щиты пересчитаны")
 
     def show_cable_summary(self):
         summary = {}
-        for sheet in self.project.sheets:
-            for r in sheet.rows:
+        for board in self.project.all_boards():
+            for r in board.rows:
                 key = (r.brand, f"{r.cores}x{r.section}")
                 if key not in summary:
-                    summary[key] = {
-                        "tray": 0.0, "corrug": 0.0, "channel": 0.0,
-                        "pvc": 0.0, "steel": 0.0, "total": 0.0
-                    }
+                    summary[key] = {"tray": 0.0, "corrug": 0.0, "channel": 0.0, "pvc": 0.0, "steel": 0.0, "total": 0.0}
                 summary[key]["tray"] += r.len_tray
                 summary[key]["corrug"] += r.len_corrug
                 summary[key]["channel"] += r.len_channel
@@ -353,90 +529,74 @@ class App(tk.Tk):
             tree.column(c, width=100, anchor="center")
         for (brand, sec), v in sorted(summary.items()):
             tree.insert("", "end", values=[
-                brand, sec,
-                f"{v['tray']:.1f}", f"{v['corrug']:.1f}", f"{v['channel']:.1f}",
+                brand, sec, f"{v['tray']:.1f}", f"{v['corrug']:.1f}", f"{v['channel']:.1f}",
                 f"{v['pvc']:.1f}", f"{v['steel']:.1f}", f"{v['total']:.1f}"
             ])
         tree.pack(fill="both", expand=True)
 
     def new_project(self):
-        if messagebox.askyesno("Новый", "Создать новый проект? Несохранённые данные будут потеряны."):
+        if messagebox.askyesno("Новый", "Создать новый проект?"):
             self.project = Project()
-            self.refresh_all()
+            self.current_board_idx = 0
+            self._update_board_list()
+            self.refresh_table()
 
     def save_project(self):
         self._sync_transformer()
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON проект", "*.json")]
-        )
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
         if not path:
             return
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.project.to_dict(), f, ensure_ascii=False, indent=2)
-        messagebox.showinfo("Сохранено", f"Проект сохранён:\n{path}")
+        messagebox.showinfo("Сохранено", path)
 
     def load_project(self):
-        path = filedialog.askopenfilename(filetypes=[("JSON проект", "*.json")])
+        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
         if not path:
             return
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         self.project = Project.from_dict(data)
-        self.refresh_all()
-        messagebox.showinfo("Загружено", f"Проект загружен:\n{path}")
-
-    def refresh_all(self):
-        # Обновляем вкладки
-        for i, sheet in enumerate(self.project.sheets):
-            self.nb.tab(i, text=sheet.title)
-            self.refresh_sheet(i)
-        # Трансформатор
+        self.current_board_idx = 0
+        self._update_board_list()
         for k, var in self.tr_vars.items():
             var.set(self.project.transformer.get(k, 0))
         self.scheme_var.set(self.project.transformer.get("scheme", "D/Yn"))
+        self.refresh_table()
+        messagebox.showinfo("Загружено", path)
 
     def export_excel(self):
         if openpyxl is None:
-            messagebox.showerror("Ошибка", "Установите openpyxl: pip install openpyxl")
+            messagebox.showerror("Ошибка", "Установите openpyxl")
             return
         self._sync_transformer()
-        path = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            filetypes=[("Excel", "*.xlsx")]
-        )
+        path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
         if not path:
             return
 
         wb = openpyxl.Workbook()
-        # Удаляем дефолтный лист
-        default = wb.active
-        wb.remove(default)
-
-        thin = Border(
-            left=Side(style='thin'), right=Side(style='thin'),
-            top=Side(style='thin'), bottom=Side(style='thin')
-        )
+        wb.remove(wb.active)
+        thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
         header_fill = PatternFill("solid", fgColor="4472C4")
         header_font = Font(bold=True, color="FFFFFF")
 
-        for sheet in self.project.sheets:
-            ws = wb.create_sheet(title=sheet.title[:31])
-            headers = [
-                "№", "Наименование", "№ группы", "Этаж", "Мощность, кВт", "Напряжение, В",
-                "cos φ", "Ток, А", "Кол-во кабелей", "Марка", "Кол-во жил", "Сечение, мм²",
-                "в лотке", "в гофре", "в канале", "в ПВХ", "в стальной трубе",
-                "Сумма длин", "Материал", "Длина линии", "Приведенная длина",
-                "ΔU, В", "ΔU, %", "Iкз1, А"
-            ]
+        headers = [
+            "№", "Наименование", "№ группы", "Этаж", "Мощность, кВт", "Напряжение, В",
+            "cos φ", "Ток, А", "Кол-во кабелей", "Марка", "Кол-во жил", "Сечение, мм²",
+            "в лотке", "в гофре", "в канале", "в ПВХ", "в стальной трубе",
+            "Сумма длин", "Материал", "Длина линии", "Приведенная длина",
+            "ΔU, В", "ΔU, %", "Iкз1, А"
+        ]
+
+        for board in self.project.all_boards():
+            ws = wb.create_sheet(title=board.title[:31])
             for col, h in enumerate(headers, 1):
                 cell = ws.cell(1, col, h)
                 cell.fill = header_fill
                 cell.font = header_font
                 cell.border = thin
                 cell.alignment = Alignment(wrap_text=True, horizontal="center")
-
-            for row_idx, r in enumerate(sheet.rows, 2):
+            for row_idx, r in enumerate(board.rows, 2):
                 vals = [
                     r.num, r.name, r.group_num, r.floor, r.power, r.voltage,
                     r.cos_phi, round(r.current, 2), r.n_cables, r.brand,
@@ -448,63 +608,67 @@ class App(tk.Tk):
                 for col, v in enumerate(vals, 1):
                     cell = ws.cell(row_idx, col, v)
                     cell.border = thin
-
-            # Автоширина
             for col in range(1, len(headers) + 1):
-                ws.column_dimensions[get_column_letter(col)].width = 12
+                ws.column_dimensions[get_column_letter(col)].width = 11
 
-        # Сводная ведомость
+        # Ведомость
         ws = wb.create_sheet("Ведомость кабелей")
-        headers = ["Марка кабеля", "жил×сечение", "в лотке", "в гофре", "в канале",
-                   "в ПВХ-трубе", "в стальной трубе", "Итого длина"]
-        for col, h in enumerate(headers, 1):
+        h2 = ["Марка кабеля", "жил×сечение", "в лотке", "в гофре", "в канале", "в ПВХ-трубе", "в стальной трубе", "Итого длина"]
+        for col, h in enumerate(h2, 1):
             cell = ws.cell(1, col, h)
             cell.fill = header_fill
             cell.font = header_font
             cell.border = thin
-
         summary = {}
-        for sheet in self.project.sheets:
-            for r in sheet.rows:
+        for board in self.project.all_boards():
+            for r in board.rows:
                 key = (r.brand, f"{r.cores}x{r.section}")
                 if key not in summary:
-                    summary[key] = [0.0]*6
+                    summary[key] = [0.0] * 6
                 summary[key][0] += r.len_tray
                 summary[key][1] += r.len_corrug
                 summary[key][2] += r.len_channel
                 summary[key][3] += r.len_pvc
                 summary[key][4] += r.len_steel
                 summary[key][5] += r.len_sum
-
         for row_idx, ((brand, sec), lens) in enumerate(sorted(summary.items()), 2):
             ws.cell(row_idx, 1, brand).border = thin
             ws.cell(row_idx, 2, sec).border = thin
             for col, v in enumerate(lens, 3):
-                cell = ws.cell(row_idx, col, round(v, 1))
-                cell.border = thin
+                ws.cell(row_idx, col, round(v, 1)).border = thin
 
-        for col in range(1, 9):
-            ws.column_dimensions[get_column_letter(col)].width = 16
-
-        # Параметры трансформатора
+        # Трансформатор
         ws = wb.create_sheet("Трансформатор")
         ws["A1"] = "Параметр"
         ws["B1"] = "Значение"
-        ws["A1"].font = header_font
-        ws["B1"].font = header_font
-        params = [
-            ("Мощность, кВА", self.project.transformer["S_kVA"]),
-            ("uk, %", self.project.transformer["uk_pct"]),
-            ("Потери КЗ, Вт", self.project.transformer["Pk_W"]),
-            ("Uнн, кВ", self.project.transformer["U_lv"]),
-            ("Схема", self.project.transformer["scheme"]),
-        ]
-        for i, (name, val) in enumerate(params, 2):
+        for i, (name, key) in enumerate([
+            ("Мощность, кВА", "S_kVA"), ("uk, %", "uk_pct"),
+            ("Потери КЗ, Вт", "Pk_W"), ("Uнн, кВ", "U_lv"), ("Схема", "scheme")
+        ], 2):
             ws.cell(i, 1, name)
-            ws.cell(i, 2, val)
+            ws.cell(i, 2, self.project.transformer[key])
 
         wb.save(path)
         messagebox.showinfo("Экспорт", f"Excel сохранён:\n{path}")
+
+    def export_schemes(self):
+        if canvas is None:
+            messagebox.showerror("Ошибка", "Установите reportlab: pip install reportlab")
+            return
+        self.recalc_all()
+        folder = filedialog.askdirectory(title="Папка для сохранения схем PDF")
+        if not folder:
+            return
+        count = 0
+        for board in self.project.all_boards():
+            safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in board.title)
+            path = os.path.join(folder, f"Схема_{safe_name}.pdf")
+            try:
+                draw_single_line_scheme(board, self.project, path)
+                count += 1
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось создать схему {board.title}:\n{e}")
+        messagebox.showinfo("Готово", f"Создано схем: {count}\nПапка: {folder}")
 
 if __name__ == "__main__":
     app = App()
